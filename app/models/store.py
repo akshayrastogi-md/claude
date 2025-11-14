@@ -1,7 +1,7 @@
 """
 Store/Tenant model for multi-tenant SaaS
 """
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, JSON
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, JSON, ForeignKey
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.core.database import Base
