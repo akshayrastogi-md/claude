@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     # API Settings
     API_V1_STR: str = "/api/v1"
+    API_URL: str = "http://localhost:8000"  # Base URL for OAuth callbacks
     PROJECT_NAME: str = "D2C Analytics & Forecasting Platform"
     VERSION: str = "1.0.0"
     DESCRIPTION: str = "Complete AI-powered analytics platform for D2C brands"
