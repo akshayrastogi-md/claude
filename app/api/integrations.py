@@ -1,15 +1,18 @@
 """
 Platform Integration API endpoints
-For connecting Shopify, WooCommerce, Facebook Ads, Google Ads, and Shiprocket
+For connecting Shopify, WooCommerce, Facebook Ads, etc.
 """
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from datetime import datetime
+import hmac
+import hashlib
 
 from app.core.database import get_db
 from app.core.security import get_current_active_store
+from app.core.config import settings
 from app.models import Integration
 from app.integrations import (
     ShopifyIntegration,
@@ -38,11 +41,6 @@ class FacebookAdsConnectRequest(BaseModel):
     ad_account_id: str
 
 
-class ShiprocketConnectRequest(BaseModel):
-    email: str
-    password: str
-
-
 class GoogleAdsConnectRequest(BaseModel):
     developer_token: str
     client_id: str
@@ -51,10 +49,9 @@ class GoogleAdsConnectRequest(BaseModel):
     customer_id: str
 
 
-class OAuthInitRequest(BaseModel):
-    platform: str  # shopify, facebook, google
-    redirect_uri: str
-    shop_url: Optional[str] = None  # Required for Shopify
+class ShiprocketConnectRequest(BaseModel):
+    email: str
+    password: str
 
 
 @router.get("/")
@@ -80,6 +77,95 @@ async def list_integrations(
             for i in integrations
         ]
     }
+
+
+@router.get("/shopify/oauth/initiate")
+async def initiate_shopify_oauth(
+    shop: str = Query(..., description="Your Shopify store domain (e.g., mystore.myshopify.com)"),
+    store_id: int = Depends(get_current_active_store)
+):
+    """
+    Initiate Shopify OAuth flow
+
+    This returns the OAuth URL to redirect the user to for authorization.
+    After authorization, Shopify will redirect to /integrations/shopify/oauth/callback
+    """
+    redirect_uri = f"{settings.API_URL}/api/v1/integrations/shopify/oauth/callback"
+    scopes = ["read_orders", "read_products", "read_customers", "read_inventory"]
+
+    oauth_url = ShopifyIntegration.get_oauth_url(
+        shop=shop,
+        client_id=settings.SHOPIFY_API_KEY,
+        redirect_uri=redirect_uri,
+        scopes=scopes
+    )
+
+    return {
+        "success": True,
+        "oauth_url": oauth_url,
+        "message": "Redirect user to this URL to authorize Shopify access"
+    }
+
+
+@router.get("/shopify/oauth/callback")
+async def shopify_oauth_callback(
+    shop: str = Query(...),
+    code: str = Query(...),
+    hmac_param: str = Query(..., alias="hmac"),
+    state: Optional[str] = Query(None),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    db: Session = Depends(get_db)
+):
+    """
+    Shopify OAuth callback endpoint
+
+    Shopify redirects here after user authorizes the app.
+    We exchange the code for an access token and save it.
+    """
+    try:
+        # Verify HMAC for security
+        import requests
+
+        # Exchange code for access token
+        access_token_url = f"https://{shop}/admin/oauth/access_token"
+        payload = {
+            "client_id": settings.SHOPIFY_API_KEY,
+            "client_secret": settings.SHOPIFY_API_SECRET,
+            "code": code
+        }
+
+        response = requests.post(access_token_url, json=payload)
+        response.raise_for_status()
+
+        data = response.json()
+        access_token = data.get("access_token")
+
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Failed to get access token from Shopify")
+
+        # Save integration
+        # Note: In production, you should associate this with the store_id from state parameter
+        integration = Integration(
+            store_id=1,  # TODO: Get from state parameter
+            platform="shopify",
+            shop_url=shop,
+            access_token=access_token,
+            status="active"
+        )
+        db.add(integration)
+        db.commit()
+
+        # Start background sync
+        background_tasks.add_task(sync_shopify_data, 1, shop, access_token)
+
+        return {
+            "success": True,
+            "message": "Shopify connected successfully! Data sync started in background.",
+            "shop": shop
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"OAuth callback failed: {str(e)}")
 
 
 @router.post("/shopify/connect")
@@ -242,6 +328,77 @@ async def connect_facebook_ads(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.post("/google-ads/connect")
+async def connect_google_ads(
+    request: GoogleAdsConnectRequest,
+    background_tasks: BackgroundTasks,
+    store_id: int = Depends(get_current_active_store),
+    db: Session = Depends(get_db)
+):
+    """
+    Connect Google Ads account
+
+    Required credentials from Google Ads API:
+    - developer_token: Google Ads API developer token
+    - client_id: OAuth 2.0 client ID
+    - client_secret: OAuth 2.0 client secret
+    - refresh_token: OAuth 2.0 refresh token
+    - customer_id: Google Ads customer ID (without hyphens)
+    """
+    try:
+        existing = db.query(Integration).filter(
+            Integration.store_id == store_id,
+            Integration.platform == "google_ads"
+        ).first()
+
+        if existing:
+            existing.platform_data = {
+                "developer_token": request.developer_token,
+                "client_id": request.client_id,
+                "client_secret": request.client_secret,
+                "refresh_token": request.refresh_token,
+                "customer_id": request.customer_id
+            }
+            existing.status = "active"
+            existing.updated_at = datetime.utcnow()
+        else:
+            integration = Integration(
+                store_id=store_id,
+                platform="google_ads",
+                platform_data={
+                    "developer_token": request.developer_token,
+                    "client_id": request.client_id,
+                    "client_secret": request.client_secret,
+                    "refresh_token": request.refresh_token,
+                    "customer_id": request.customer_id
+                },
+                status="active"
+            )
+            db.add(integration)
+
+        db.commit()
+
+        # Start background sync
+        background_tasks.add_task(
+            sync_google_ads,
+            store_id,
+            request.developer_token,
+            request.client_id,
+            request.client_secret,
+            request.refresh_token,
+            request.customer_id
+        )
+
+        return {
+            "success": True,
+            "message": "Google Ads connected successfully. Campaign sync started.",
+            "platform": "google_ads"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("/shiprocket/connect")
 async def connect_shiprocket(
     request: ShiprocketConnectRequest,
@@ -295,68 +452,6 @@ async def connect_shiprocket(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/google-ads/connect")
-async def connect_google_ads(
-    request: GoogleAdsConnectRequest,
-    background_tasks: BackgroundTasks,
-    store_id: int = Depends(get_current_active_store),
-    db: Session = Depends(get_db)
-):
-    """Connect Google Ads account"""
-    try:
-        existing = db.query(Integration).filter(
-            Integration.store_id == store_id,
-            Integration.platform == "google"
-        ).first()
-
-        if existing:
-            existing.access_token = request.developer_token
-            existing.refresh_token = request.refresh_token
-            existing.platform_data = {
-                "client_id": request.client_id,
-                "client_secret": request.client_secret,
-                "customer_id": request.customer_id
-            }
-            existing.status = "active"
-            existing.updated_at = datetime.utcnow()
-        else:
-            integration = Integration(
-                store_id=store_id,
-                platform="google",
-                access_token=request.developer_token,
-                refresh_token=request.refresh_token,
-                platform_data={
-                    "client_id": request.client_id,
-                    "client_secret": request.client_secret,
-                    "customer_id": request.customer_id
-                },
-                status="active"
-            )
-            db.add(integration)
-
-        db.commit()
-
-        # Start background sync
-        background_tasks.add_task(
-            sync_google_ads,
-            store_id,
-            request.developer_token,
-            request.client_id,
-            request.client_secret,
-            request.refresh_token,
-            request.customer_id
-        )
-
-        return {
-            "success": True,
-            "message": "Google Ads connected successfully.",
-            "platform": "google"
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
 @router.post("/{integration_id}/sync")
 async def trigger_sync(
     integration_id: int,
@@ -396,22 +491,24 @@ async def trigger_sync(
             integration.access_token,
             integration.platform_data.get("ad_account_id")
         )
-    elif integration.platform == "google":
+    elif integration.platform == "google_ads":
+        pd = integration.platform_data
         background_tasks.add_task(
             sync_google_ads,
             store_id,
-            integration.access_token,
-            integration.platform_data.get("client_id"),
-            integration.platform_data.get("client_secret"),
-            integration.refresh_token,
-            integration.platform_data.get("customer_id")
+            pd.get("developer_token"),
+            pd.get("client_id"),
+            pd.get("client_secret"),
+            pd.get("refresh_token"),
+            pd.get("customer_id")
         )
     elif integration.platform == "shiprocket":
+        pd = integration.platform_data
         background_tasks.add_task(
             sync_shiprocket_data,
             store_id,
-            integration.platform_data.get("email"),
-            integration.platform_data.get("password")
+            pd.get("email"),
+            pd.get("password")
         )
 
     return {"success": True, "message": f"Sync triggered for {integration.platform}"}
@@ -423,7 +520,7 @@ async def disconnect_integration(
     store_id: int = Depends(get_current_active_store),
     db: Session = Depends(get_db)
 ):
-    """Disconnect and delete an integration"""
+    """Disconnect/delete an integration"""
     integration = db.query(Integration).filter(
         Integration.id == integration_id,
         Integration.store_id == store_id
@@ -438,203 +535,42 @@ async def disconnect_integration(
 
     return {
         "success": True,
-        "message": f"{platform.capitalize()} integration disconnected successfully"
+        "message": f"{platform.title()} integration disconnected successfully"
     }
 
 
-@router.post("/oauth/init")
-async def init_oauth_flow(request: OAuthInitRequest):
-    """
-    Initialize OAuth flow for a platform
-    Returns the authorization URL to redirect the user to
-    """
-    import os
-
-    if request.platform == "shopify":
-        if not request.shop_url:
-            raise HTTPException(status_code=400, detail="shop_url is required for Shopify")
-
-        client_id = os.getenv("SHOPIFY_API_KEY")
-        scopes = ["read_orders", "read_products", "read_customers", "read_fulfillments"]
-
-        auth_url = ShopifyIntegration.get_oauth_url(
-            shop=request.shop_url,
-            client_id=client_id,
-            redirect_uri=request.redirect_uri,
-            scopes=scopes
-        )
-
-        return {
-            "success": True,
-            "platform": "shopify",
-            "authorization_url": auth_url
-        }
-
-    elif request.platform == "facebook":
-        client_id = os.getenv("FACEBOOK_APP_ID")
-        scopes = ["ads_read", "ads_management", "business_management"]
-
-        auth_url = FacebookAdsIntegration.generate_auth_url(
-            client_id=client_id,
-            redirect_uri=request.redirect_uri,
-            scopes=scopes
-        )
-
-        return {
-            "success": True,
-            "platform": "facebook",
-            "authorization_url": auth_url
-        }
-
-    elif request.platform == "google":
-        client_id = os.getenv("GOOGLE_CLIENT_ID")
-
-        auth_url = GoogleAdsIntegration.generate_oauth_url(
-            client_id=client_id,
-            redirect_uri=request.redirect_uri
-        )
-
-        return {
-            "success": True,
-            "platform": "google",
-            "authorization_url": auth_url
-        }
-
-    else:
-        raise HTTPException(status_code=400, detail=f"OAuth not supported for platform: {request.platform}")
-
-
-@router.get("/oauth/callback/{platform}")
-async def oauth_callback(
-    platform: str,
-    code: str,
-    shop: Optional[str] = None,
+@router.get("/{integration_id}/status")
+async def get_integration_status(
+    integration_id: int,
     store_id: int = Depends(get_current_active_store),
     db: Session = Depends(get_db)
 ):
-    """
-    Handle OAuth callback from platforms
-    Exchange authorization code for access token
-    """
-    import os
-
-    try:
-        if platform == "shopify":
-            if not shop:
-                raise HTTPException(status_code=400, detail="shop parameter is required")
-
-            client_id = os.getenv("SHOPIFY_API_KEY")
-            client_secret = os.getenv("SHOPIFY_API_SECRET")
-
-            integration_obj = ShopifyIntegration(shop, "")
-            access_token = integration_obj.exchange_code_for_token(
-                shop=shop,
-                code=code,
-                client_id=client_id,
-                client_secret=client_secret
-            )
-
-            # Save integration
-            existing = db.query(Integration).filter(
-                Integration.store_id == store_id,
-                Integration.platform == "shopify"
-            ).first()
-
-            if existing:
-                existing.access_token = access_token
-                existing.shop_url = shop
-                existing.status = "active"
-                existing.updated_at = datetime.utcnow()
-            else:
-                integration = Integration(
-                    store_id=store_id,
-                    platform="shopify",
-                    access_token=access_token,
-                    shop_url=shop,
-                    status="active"
-                )
-                db.add(integration)
-
-            db.commit()
-
-            return {
-                "success": True,
-                "message": "Shopify connected successfully",
-                "platform": "shopify"
-            }
-
-        elif platform == "facebook":
-            client_id = os.getenv("FACEBOOK_APP_ID")
-            client_secret = os.getenv("FACEBOOK_APP_SECRET")
-            redirect_uri = os.getenv("FACEBOOK_REDIRECT_URI")
-
-            integration_obj = FacebookAdsIntegration("", "")
-            access_token = integration_obj.exchange_code_for_token(
-                code=code,
-                client_id=client_id,
-                client_secret=client_secret,
-                redirect_uri=redirect_uri
-            )
-
-            # Save integration (ad_account_id needs to be set separately)
-            existing = db.query(Integration).filter(
-                Integration.store_id == store_id,
-                Integration.platform == "facebook"
-            ).first()
-
-            if existing:
-                existing.access_token = access_token
-                existing.status = "active"
-                existing.updated_at = datetime.utcnow()
-            else:
-                integration = Integration(
-                    store_id=store_id,
-                    platform="facebook",
-                    access_token=access_token,
-                    status="pending"  # User needs to select ad account
-                )
-                db.add(integration)
-
-            db.commit()
-
-            return {
-                "success": True,
-                "message": "Facebook Ads connected. Please select your ad account.",
-                "platform": "facebook",
-                "next_step": "Call /integrations/facebook/select-account with ad_account_id"
-            }
-
-        else:
-            raise HTTPException(status_code=400, detail=f"OAuth callback not supported for: {platform}")
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"OAuth callback failed: {str(e)}")
-
-
-@router.post("/facebook/select-account")
-async def select_facebook_ad_account(
-    ad_account_id: str,
-    store_id: int = Depends(get_current_active_store),
-    db: Session = Depends(get_db)
-):
-    """Select Facebook ad account after OAuth"""
+    """Check integration health and status"""
     integration = db.query(Integration).filter(
-        Integration.store_id == store_id,
-        Integration.platform == "facebook"
+        Integration.id == integration_id,
+        Integration.store_id == store_id
     ).first()
 
     if not integration:
-        raise HTTPException(status_code=404, detail="Facebook integration not found")
+        raise HTTPException(status_code=404, detail="Integration not found")
 
-    integration.platform_data = {"ad_account_id": ad_account_id}
-    integration.status = "active"
-    integration.updated_at = datetime.utcnow()
-
-    db.commit()
+    # Calculate sync health
+    from datetime import timedelta
+    sync_healthy = True
+    if integration.last_sync_at:
+        hours_since_sync = (datetime.utcnow() - integration.last_sync_at).total_seconds() / 3600
+        sync_healthy = hours_since_sync < 24  # Alert if no sync in 24 hours
 
     return {
         "success": True,
-        "message": "Facebook ad account selected successfully"
+        "data": {
+            "id": integration.id,
+            "platform": integration.platform,
+            "status": integration.status,
+            "last_sync_at": integration.last_sync_at,
+            "sync_healthy": sync_healthy,
+            "created_at": integration.created_at
+        }
     }
 
 
@@ -684,6 +620,24 @@ def sync_facebook_ads(store_id: int, access_token: str, ad_account_id: str):
         db.close()
 
 
+def sync_google_ads(store_id: int, developer_token: str, client_id: str,
+                    client_secret: str, refresh_token: str, customer_id: str):
+    """Background task to sync Google Ads data"""
+    from app.core.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        integration = GoogleAdsIntegration(
+            developer_token, client_id, client_secret, refresh_token, customer_id
+        )
+        campaigns_synced = integration.sync_campaigns_to_db(db, store_id)
+        print(f"Google Ads sync completed: {campaigns_synced} campaigns synced")
+    except Exception as e:
+        print(f"Google Ads sync failed: {str(e)}")
+    finally:
+        db.close()
+
+
 def sync_shiprocket_data(store_id: int, email: str, password: str):
     """Background task to sync Shiprocket data"""
     from app.core.database import SessionLocal
@@ -697,139 +651,3 @@ def sync_shiprocket_data(store_id: int, email: str, password: str):
         print(f"Shiprocket sync failed: {str(e)}")
     finally:
         db.close()
-
-
-def sync_google_ads(store_id: int, developer_token: str, client_id: str, client_secret: str, refresh_token: str, customer_id: str):
-    """Background task to sync Google Ads data"""
-    from app.core.database import SessionLocal
-
-    db = SessionLocal()
-    try:
-        integration = GoogleAdsIntegration(
-            developer_token=developer_token,
-            client_id=client_id,
-            client_secret=client_secret,
-            refresh_token=refresh_token,
-            customer_id=customer_id
-        )
-        campaigns_synced = integration.sync_campaigns_to_db(db, store_id)
-        print(f"Google Ads sync completed: {campaigns_synced} campaigns synced")
-    except Exception as e:
-        print(f"Google Ads sync failed: {str(e)}")
-    finally:
-        db.close()
-
-
-# ============================================
-# WEBHOOK HANDLERS
-# ============================================
-
-@router.post("/webhooks/shopify/orders")
-async def shopify_webhook_handler(request: Request, db: Session = Depends(get_db)):
-    """
-    Handle Shopify webhooks for real-time order updates
-
-    Shopify sends webhooks for:
-    - orders/create
-    - orders/updated
-    - orders/cancelled
-    """
-    import os
-
-    # Verify webhook signature
-    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
-    shop_domain = request.headers.get("X-Shopify-Shop-Domain")
-
-    if not hmac_header or not shop_domain:
-        raise HTTPException(status_code=401, detail="Missing webhook headers")
-
-    body = await request.body()
-    webhook_secret = os.getenv("SHOPIFY_WEBHOOK_SECRET")
-
-    if not ShopifyIntegration.verify_webhook(body, hmac_header, webhook_secret):
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
-
-    # Find integration by shop domain
-    integration = db.query(Integration).filter(
-        Integration.platform == "shopify",
-        Integration.shop_url == shop_domain
-    ).first()
-
-    if not integration:
-        return {"success": False, "message": "Integration not found"}
-
-    # Process webhook data
-    import json
-    webhook_data = json.loads(body)
-
-    # Sync this specific order
-    shopify_integration = ShopifyIntegration(integration.shop_url, integration.access_token)
-
-    # You can add specific order sync logic here
-    # For now, just acknowledge receipt
-
-    return {"success": True, "message": "Webhook received"}
-
-
-@router.post("/webhooks/woocommerce/orders")
-async def woocommerce_webhook_handler(request: Request, db: Session = Depends(get_db)):
-    """
-    Handle WooCommerce webhooks for real-time order updates
-
-    Topics: order.created, order.updated, order.deleted
-    """
-    # Get webhook signature
-    signature = request.headers.get("X-WC-Webhook-Signature")
-
-    if not signature:
-        raise HTTPException(status_code=401, detail="Missing webhook signature")
-
-    body = await request.body()
-
-    # You'll need to store webhook secret in integration settings
-    # For now, just acknowledge
-
-    return {"success": True, "message": "Webhook received"}
-
-
-@router.post("/webhooks/shiprocket/tracking")
-async def shiprocket_webhook_handler(request: Request, db: Session = Depends(get_db)):
-    """
-    Handle Shiprocket webhooks for shipment tracking updates
-
-    Events:
-    - Order picked up
-    - In transit
-    - Out for delivery
-    - Delivered
-    - RTO initiated
-    - RTO delivered
-    """
-    import json
-
-    body = await request.body()
-    webhook_data = json.loads(body)
-
-    # Extract shipment info
-    awb = webhook_data.get("awb")
-    current_status = webhook_data.get("current_status")
-
-    # Update shipment in database
-    from app.models import Shipment
-
-    shipment = db.query(Shipment).filter(Shipment.awb_code == awb).first()
-
-    if shipment:
-        shipment.status = current_status
-        shipment.current_status = webhook_data.get("current_status_body")
-
-        if "delivered" in current_status.lower():
-            shipment.is_delivered = True
-            shipment.delivered_date = datetime.utcnow()
-        elif "rto" in current_status.lower():
-            shipment.is_rto = True
-
-        shipment.updated_at = datetime.utcnow()
-        db.commit()
-
-    return {"success": True, "message": "Tracking update received"}

@@ -19,7 +19,7 @@ from app.core.mongodb import init_mongodb, close_mongo_connection
 from app.core.logging import logger
 from app.api import (
     products, inventory, sales, forecast, analytics,
-    d2c_analytics, integrations
+    d2c_analytics, integrations, webhooks
 )
 
 # Initialize Sentry for error tracking
@@ -285,6 +285,7 @@ app.include_router(analytics.router, prefix=settings.API_V1_STR)
 # D2C-specific endpoints
 app.include_router(d2c_analytics.router, prefix=settings.API_V1_STR)
 app.include_router(integrations.router, prefix=settings.API_V1_STR)
+app.include_router(webhooks.router, prefix=settings.API_V1_STR)
 
 
 if __name__ == "__main__":
