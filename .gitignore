@@ -36,11 +36,34 @@ ENV/
 # Environment
 .env
 .env.local
+.env.production
+.env.*
+!.env.example
 
 # Database
 *.db
 *.sqlite
 *.sqlite3
+
+# PostgreSQL
+pgdata/
+
+# MongoDB
+mongodata/
+
+# Redis
+redis_data/
+
+# Backups
+backups/
+*.sql
+*.sql.gz
+
+# SSL Certificates
+nginx/ssl/*.pem
+nginx/ssl/*.key
+*.crt
+*.csr
 
 # Logs
 *.log
